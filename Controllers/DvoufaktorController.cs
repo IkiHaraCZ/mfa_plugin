@@ -1,230 +1,225 @@
 ﻿using System;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
+using Datona.MobilniCisnik.Server;
 using Datona.Web.Code;
 using Datona.Web.Code.Security;
-using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Logging;
 
 namespace Datona.Web.Controllers
 {
     [Route("TwoFA")]
     public class DvoufaktorController : Controller
     {
-        private const string LoginSessionUserKey = "MFA_Login_UserId";
-
         private readonly IMfaStore _store;
         private readonly ITotpService _totp;
         private readonly ISecretProtector _protector;
         private readonly IBackupCodeService _backup;
-        private readonly MfaPozadavkyVolby _rules;
+        private readonly MfaPozadavkyVolby _opts;
         private readonly GcrHelper _gcr;
+        private readonly ILogger<DvoufaktorController> _log;
 
         public DvoufaktorController(
             IMfaStore store,
             ITotpService totp,
             ISecretProtector protector,
             IBackupCodeService backup,
-            MfaPozadavkyVolby rules,
-            GcrHelper gcr)
+            MfaPozadavkyVolby opts,
+            GcrHelper gcr,
+            ILogger<DvoufaktorController> log)
         {
             _store = store;
             _totp = totp;
             _protector = protector;
             _backup = backup;
-            _rules = rules;
+            _opts = opts;
             _gcr = gcr;
+            _log = log;
         }
 
-        // ========= Pomocné získání uživatele =========
-
-        private long GetCurrentUserIdOrZero()
+        // Pomocně: aktuální loginentity_id
+        private long GetCurrentUserIdOrThrow()
         {
-            // V tvém projektu je k dispozici přes .ASPXAUTH -> GCR instance
+            var aspx = Request.Cookies[".ASPXAUTH"];
+            var ac = !string.IsNullOrEmpty(aspx) ? AuthCookie.AuthenticationClaim(aspx) : null;
+            if (ac == null) throw new InvalidOperationException("Nejste přihlášen.");
+            var inst = _gcr.Instance(new UserContext
+            {
+                Login = ac.UserName,
+                HesloMD5 = ac.HesloMD5,
+                MacAddress = "00-0C-E3-24-5A-CC",
+                language_id = "1",
+                InstanceId = ac.InstanceId,
+                Guid_externi_db = ac.Guid_externi_db
+            });
+            if (inst == null) throw new InvalidOperationException("Nelze získat GCR instanci.");
+            return inst.GetLoginentityId();
+        }
+
+        private string ClientIp() => HttpContext?.Connection?.RemoteIpAddress?.ToString() ?? "";
+        private string UserAgent() => Request?.Headers["User-Agent"].ToString() ?? "";
+
+        // STEP 1: zahájit nastavení – vytvoří PENDING TOTP metodu, vrátí QR a „manual“ string (jen k opsání, ne vlastní secret)
+        [HttpPost("start")]
+        public async Task<IActionResult> Start()
+        {
             try
             {
-                return _gcr.PublicInstance()?.GetLoginentityId() ?? 0;
-            }
-            catch
-            {
-                return 0;
-            }
-        }
+                var userId = GetCurrentUserIdOrThrow();
 
-        private long GetPendingLoginUserIdOrZero()
-        {
-            var s = HttpContext.Session.GetString(LoginSessionUserKey);
-            return long.TryParse(s, out var id) ? id : 0;
-        }
+                // Pokud už má aktivní metodu, vrať informaci (tlačítko v UI se má stejně zobrazovat jen pokud není 2FA nastaveno)
+                if (await _store.HasAnyActiveMethodAsync(userId))
+                    return Json(new { ok = false, error = "Už máte aktivní 2FA." });
 
-        // ========= A) SETUP WIZARD (modál v _Layout) =========
-
-        /// <summary>
-        /// Připraví pending TOTP (pokud není), vrátí otpauth URI + manuální kód.
-        /// </summary>
-        [HttpPost("StartJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> StartJson()
-        {
-            var uid = GetCurrentUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, err = "Uživatel není přihlášen." });
-
-            var pending = await _store.GetLatestPendingTotpAsync(uid);
-            if (pending == null)
-            {
-                // vygeneruj secret a ulož meta_json do pending záznamu
+                // vygenerovat secret a metadata
                 var secret = _totp.GenerateSecret();
-                var issuer = string.IsNullOrWhiteSpace(_rules.Issuer) ? "PiCCOLO" : _rules.Issuer;
-                var label = $"{issuer}:{uid}";
-                var meta = _totp.BuildMetaJson(secret, issuer, label, 30, 6); // přizpůsob své implementaci
-                await _store.CreatePendingTotpAsync(uid, meta);
-                pending = await _store.GetLatestPendingTotpAsync(uid);
+                var label = $"{_opts.Issuer}:{userId}";
+                var metaJson = _totp.BuildMetaJson(secret, _opts.Issuer, label, period: 30, digits: 6);
+
+                // uložit pending metodu
+                var methodId = await _store.CreatePendingTotpAsync(userId, _protector.Protect(metaJson));
+
+                // QR/URI
+                var otpAuthUri = _totp.BuildOtpAuthUri(_opts.Issuer, label, secret, digits: 6, period: 30);
+                // QR controller už v projektu máš: /qr/otp?data=...&size=240
+                var qrUrl = Url.Content($"/qr/otp?data={Uri.EscapeDataString(otpAuthUri)}&size=240");
+                var manual = _totp.FormatManualKey(secret);
+
+                await _store.InsertAuditAsync(userId, "mfa.start", ClientIp(), UserAgent(), new { methodId });
+
+                return Json(new
+                {
+                    ok = true,
+                    methodId,
+                    qrUrl,
+                    manualKey = manual
+                });
             }
-
-            var (secretRaw, issuer2, label2, period, digits) = _totp.ParseMeta(pending!.MetaJson);
-            var otpAuthUri = _totp.BuildOtpAuthUri(issuer2, label2, secretRaw, digits, period);
-            var manualKey = _totp.FormatManualKey(secretRaw);
-
-            return Json(new { ok = true, otpAuthUri, manualKey });
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA/Start error");
+                return Json(new { ok = false, error = ex.Message });
+            }
         }
 
-        /// <summary>
-        /// Ověří TOTP kód; při úspěchu vygeneruje záložní kódy (hash uloží do DB, plaintext vrátí).
-        /// </summary>
-        [HttpPost("VerifyTotpJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> VerifyTotpJson([FromForm] string code)
+        // STEP 1b: ověř TOTP kód proti pending metodě
+        [HttpPost("verify-totp")]
+        public async Task<IActionResult> VerifyTotp([FromForm] long methodId, [FromForm] string code)
         {
-            var uid = GetCurrentUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, err = "Uživatel není přihlášen." });
+            try
+            {
+                var userId = GetCurrentUserIdOrThrow();
+                var method = await _store.GetLatestPendingTotpAsync(userId);
+                if (method == null || method.Id != methodId)
+                    return Json(new { ok = false, error = "Metoda nenalezena nebo už není v nastavení." });
 
-            var pending = await _store.GetLatestPendingTotpAsync(uid);
-            if (pending == null) return Json(new { ok = false, err = "Nenalezeno čekající nastavení." });
+                // rozbal meta
+                var metaProtected = method.MetaJson;
+                var metaJson = _protector.Unprotect(metaProtected);
+                var (secret, issuer, label, period, digits) = _totp.ParseMeta(metaJson);
 
-            var (secretRaw, _, _, _, _) = _totp.ParseMeta(pending.MetaJson);
-            if (!_totp.ValidateCode(secretRaw, code?.Trim()))
-                return Json(new { ok = false, err = "Nesprávný kód. Zkuste to znovu." });
+                if (!_totp.ValidateCode(secret, code))
+                {
+                    await _store.InsertAuditAsync(userId, "mfa.verify_totp_fail", ClientIp(), UserAgent(), new { methodId });
+                    return Json(new { ok = false, error = "Kód nesouhlasí." });
+                }
 
-            // volitelně: smazat staré nepoužité záložní kódy
-            await _store.RemoveUnusedBackupCodesAsync(uid);
-
-            var count = _rules.BackupCodesCount > 0 ? _rules.BackupCodesCount : 10;
-            var plain = _backup.GeneratePlaintextCodes(count).ToArray();
-            foreach (var c in plain)
-                await _store.InsertBackupCodesAsync(uid, new[] { _backup.Hash(c) });
-
-            return Json(new { ok = true, codes = plain });
+                await _store.InsertAuditAsync(userId, "mfa.verify_totp_ok", ClientIp(), UserAgent(), new { methodId });
+                return Json(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA/VerifyTotp error");
+                return Json(new { ok = false, error = ex.Message });
+            }
         }
 
-        /// <summary>
-        /// Ověří jeden záložní kód (bez spotřeby) a aktivuje pending TOTP.
-        /// </summary>
-        [HttpPost("VerifyBackupJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> VerifyBackupJson([FromForm] string code)
+        // STEP 2: vygeneruj batch záložních kódů (uloží se jen hash, plaintext pošleme jednou)
+        [HttpPost("generate-backups")]
+        public async Task<IActionResult> GenerateBackups([FromForm] long methodId)
         {
-            var uid = GetCurrentUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, err = "Uživatel není přihlášen." });
+            try
+            {
+                var userId = GetCurrentUserIdOrThrow();
 
-            var unused = await _store.GetUnusedBackupCodesAsync(uid);
-            var match = unused.FirstOrDefault(b => _backup.Verify(code?.Trim() ?? "", b.CodeHash));
-            if (match == null)
-                return Json(new { ok = false, err = "Zadaný kód není platný." });
+                // čistka nepoužitých předchozích batchů
+                await _store.RemoveUnusedBackupCodesAsync(userId);
 
-            // Neznačíme jako "použitý" – pouze ověřujeme, že kódy má uložené.
+                var plain = _backup.GeneratePlaintextCodes(_opts.BackupCodesCount).ToList();
+                var hashed = plain.Select(_backup.Hash).ToList();
+                await _store.InsertBackupCodesAsync(userId, hashed);
 
-            var pending = await _store.GetLatestPendingTotpAsync(uid);
-            if (pending != null)
-                await _store.ActivateMethodAsync(pending.Id);
+                await _store.InsertAuditAsync(userId, "mfa.backups_generated", ClientIp(), UserAgent(), new { methodId, count = plain.Count });
 
-            return Json(new { ok = true });
+                return Json(new { ok = true, codes = plain });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA/GenerateBackups error");
+                return Json(new { ok = false, error = ex.Message });
+            }
         }
 
-        /// <summary>
-        /// Zda má aktuální uživatel nějakou aktivní 2FA metodu.
-        /// </summary>
-        [HttpGet("StatusJson")]
-        public async Task<IActionResult> StatusJson()
+        // STEP 3: potvrď, že si je uživatel uložil (jen audit + server nic nemaže)
+        [HttpPost("confirm-saved")]
+        public async Task<IActionResult> ConfirmSaved([FromForm] long methodId)
         {
-            var uid = GetCurrentUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, hasActive = false });
-            var has = await _store.HasAnyActiveMethodAsync(uid);
-            return Json(new { ok = true, hasActive = has });
+            try
+            {
+                var userId = GetCurrentUserIdOrThrow();
+                await _store.InsertAuditAsync(userId, "mfa.backups_confirmed", ClientIp(), UserAgent(), new { methodId });
+                return Json(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA/ConfirmSaved error");
+                return Json(new { ok = false, error = ex.Message });
+            }
         }
 
-        /// <summary>
-        /// Vypnutí 2FA: zruší metody a smaže záložní kódy (volitelné do budoucna).
-        /// </summary>
-        [HttpPost("RevokeJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> RevokeJson()
+        // STEP 3b: ověř jeden záložní kód (NEspotřebovat! pouze ověřit — musí projít hashovaným porovnáním)
+        [HttpPost("verify-backup")]
+        public async Task<IActionResult> VerifyBackup([FromForm] long methodId, [FromForm] string code)
         {
-            var uid = GetCurrentUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, err = "Uživatel není přihlášen." });
+            try
+            {
+                var userId = GetCurrentUserIdOrThrow();
+                var all = await _store.GetUnusedBackupCodesAsync(userId);
+                var ok = all.Any(x => _backup.Verify(code, x.CodeHash));
+                if (!ok)
+                {
+                    await _store.InsertAuditAsync(userId, "mfa.verify_backup_fail", ClientIp(), UserAgent(), new { methodId });
+                    return Json(new { ok = false, error = "Zadaný záložní kód není z této dávky." });
+                }
 
-            await _store.RevokeAllMethodsAsync(uid);
-            await _store.DeleteAllBackupCodesAsync(uid);
-
-            return Json(new { ok = true });
+                await _store.InsertAuditAsync(userId, "mfa.verify_backup_ok", ClientIp(), UserAgent(), new { methodId });
+                return Json(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA/VerifyBackup error");
+                return Json(new { ok = false, error = ex.Message });
+            }
         }
 
-        // ========= B) 2FA PŘI PŘIHLÁŠENÍ (login flow) =========
-        // Tohle nespouští wizard – to je separátní (typicky jiný modál na login stránce).
-
-        /// <summary>
-        /// Uloží userId do session a vrátí, zda je 2FA povinné (tj. má aktivní metodu).
-        /// Volá se po úspěšné kontrole hesla, ale před vydáním .ASPXAUTH.
-        /// </summary>
-        [HttpPost("Login/BeginJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> LoginBeginJson([FromForm] long userId)
+        // STEP 4: aktivuj metodu (Pending -> Active)
+        [HttpPost("activate")]
+        public async Task<IActionResult> Activate([FromForm] long methodId)
         {
-            if (userId <= 0) return Json(new { ok = false, err = "Neplatný uživatel." });
-
-            HttpContext.Session.SetString(LoginSessionUserKey, userId.ToString());
-
-            var required = await _store.HasAnyActiveMethodAsync(userId);
-            return Json(new { ok = true, require2fa = required });
-        }
-
-        /// <summary>
-        /// Ověří TOTP kód pro pending-login uživatele v session.
-        /// </summary>
-        [HttpPost("Login/VerifyTotpJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> LoginVerifyTotpJson([FromForm] string code)
-        {
-            var uid = GetPendingLoginUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, err = "Session 2FA nenalezena." });
-
-            var active = await _store.GetActiveTotpAsync(uid);
-            if (active == null) return Json(new { ok = false, err = "2FA není aktivní." });
-
-            var (secretRaw, _, _, _, _) = _totp.ParseMeta(active.MetaJson);
-            if (!_totp.ValidateCode(secretRaw, code?.Trim()))
-                return Json(new { ok = false, err = "Nesprávný kód." });
-
-            await _store.SetMethodLastUsedAsync(active.Id, DateTime.Now);
-            return Json(new { ok = true });
-        }
-
-        /// <summary>
-        /// Ověří záložní kód pro pending-login uživatele v session (kód se spotřebuje).
-        /// </summary>
-        [HttpPost("Login/VerifyBackupJson")]
-        [ValidateAntiForgeryToken]
-        public async Task<IActionResult> LoginVerifyBackupJson([FromForm] string code)
-        {
-            var uid = GetPendingLoginUserIdOrZero();
-            if (uid <= 0) return Json(new { ok = false, err = "Session 2FA nenalezena." });
-
-            var unused = await _store.GetUnusedBackupCodesAsync(uid);
-            var match = unused.FirstOrDefault(b => _backup.Verify(code?.Trim() ?? "", b.CodeHash));
-            if (match == null)
-                return Json(new { ok = false, err = "Neplatný kód." });
-
-            await _store.MarkBackupCodeUsedAsync(match.Id, DateTime.Now);
-            return Json(new { ok = true });
+            try
+            {
+                var userId = GetCurrentUserIdOrThrow();
+                await _store.ActivateMethodAsync(methodId);
+                await _store.InsertAuditAsync(userId, "mfa.activated", ClientIp(), UserAgent(), new { methodId });
+                return Json(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA/Activate error");
+                return Json(new { ok = false, error = ex.Message });
+            }
         }
     }
 }
