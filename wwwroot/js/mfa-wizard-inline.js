@@ -83,7 +83,7 @@
             // init
             showStep('mfaW-step1');
             try {
-                const r = await post('/TwoFA/StartJson');
+                const r = await post('/Dvoufaktor/StartJson');
                 if (r.ok) {
                     if (byId('mfaW-qr')) byId('mfaW-qr').src = '/qr/otp?data=' + encodeURIComponent(r.otpAuthUri) + '&size=240';
                     if (byId('mfaW-manual')) byId('mfaW-manual').innerText = r.manualKey || '';
@@ -102,7 +102,7 @@
             if (!code) { setErr('mfaW-err1', 'Zadejte kód.'); return; }
 
             try {
-                const r = await post('/TwoFA/VerifyTotpJson', { code });
+                const r = await post('/Dvoufaktor/VerifyTotpJson', { code });
                 if (r.ok) {
                     const box = byId('mfaW-codes');
                     if (box) {
@@ -136,7 +136,7 @@
             if (!code) { setErr('mfaW-err3', 'Zadejte kód.'); return; }
 
             try {
-                const r = await post('/TwoFA/VerifyBackupJson', { code });
+                const r = await post('/Dvoufaktor/VerifyBackupJson', { code });
                 if (r.ok) {
                     showStep('mfaW-step4');
                 } else {
@@ -157,7 +157,7 @@
 
         afterFinish: function () {
             // pøípadnì pøepnout UI (napø. na "Vypnout 2FA")
-            // location.reload();
+            location.reload();
         }
     };
 

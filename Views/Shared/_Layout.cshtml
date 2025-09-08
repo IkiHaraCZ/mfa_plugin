@@ -107,7 +107,7 @@
                             <!--Změna hesla?-->
                             <a class="dropdown-item" asp-controller="Home" asp-action="ZmenaHesla">@L.GetResource("Layout_ZmenaHesla")</a>
                             <!--Nastavení účtu?-->
-                            <a class="dropdown-item" href="javascript:void(0)" onclick="MFAW.show()">🔐 Nastavit 2FA</a>
+                            @await Component.InvokeAsync("TwoFaMenu")
                             <!--Michal 3.9.2025-->
                             <a id="design-standard" class="dropdown-item" href="javascript:void(0)" onclick="SetLayoutCSS('site-orig.css')">Design: Standard</a>
                             <a id="design-modern" class="dropdown-item" href="javascript:void(0)" onclick="SetLayoutCSS('site.css')">Design: Modern</a>
@@ -328,6 +328,7 @@
 </div>
 
 <!-- 2FA Wizard Modal -->
+<script src="~/js/mfa-wizard-inline.js"></script>
 <div class="modal" id="mfaWizardModal" tabindex="-1" role="dialog" aria-hidden="true" style="z-index: 1100">
     <div class="modal-dialog" role="document" style="max-width: 400px;">
         <div class="modal-content shadow-lg border-primary">
@@ -398,97 +399,10 @@
         </div>
     </div>
 </div>
-@Html.AntiForgeryToken()
-<script>
-    // ===== Helpers =====
-    const MFAW = (function () {
-      const $ = (id) => document.getElementById(id);
-      const token = (function(){ const i=document.querySelector('input[name="__RequestVerificationToken"]'); return i?i.value:null; })();
 
-      function show(id){ document.querySelectorAll('.mfaW-step').forEach(x=>x.style.display='none'); const el=$(id); if(el) el.style.display='block'; }
-      async function post(url, data) {
-        const form = new URLSearchParams();
-        if (token) form.append('__RequestVerificationToken', token);
-        if (data) Object.keys(data).forEach(k => form.append(k, data[k] ?? ''));
-        const res = await fetch(url, { method: 'POST', headers: { 'Accept': 'application/json' }, body: form });
-        return await res.json();
-      }
-
-      return {
-        show: async function () {
-          // otevřít modal
-          $('#mfaWizardModal').modal('show');
-          // reset stavu
-          ['mfaW-err1','mfaW-err2','mfaW-err3'].forEach(id=>{ const e=$(id); if(e) e.style.display='none'; });
-          $('mfaW-totp').value = '';
-          $('mfaW-backup').value = '';
-          $('mfaW-codes').innerHTML = '';
-          if ($('mfaW-saved')) $('mfaW-saved').checked = false;
-
-          // init (pendující metoda + QR + manuál)
-          show('mfaW-step1');
-          try {
-            const r = await post('/TwoFA/StartJson');
-            if (r.ok) {
-              $('mfaW-qr').src = '/qr/otp?data=' + encodeURIComponent(r.otpAuthUri) + '&size=240';
-              $('mfaW-manual').innerText = r.manualKey || '';
-              setTimeout(()=> $('mfaW-totp').focus(), 80);
-            } else {
-              const e=$('mfaW-err1'); e.innerText = r.err || 'Chyba inicializace.'; e.style.display='';
-            }
-          } catch {
-            const e=$('mfaW-err1'); e.innerText = 'Chyba sítě.'; e.style.display='';
-          }
-        },
-
-        verifyTotp: async function(){
-          const code = $('mfaW-totp').value.trim();
-          const e = $('mfaW-err1'); e.style.display='none';
-          if (!code){ e.innerText='Zadejte kód.'; e.style.display=''; return; }
-          try {
-            const r = await post('/TwoFA/VerifyTotpJson', { code });
-            if (r.ok){
-              const box = $('mfaW-codes'); box.innerHTML = '';
-              (r.codes || []).forEach(c => { const div=document.createElement('div'); div.textContent=c; box.appendChild(div); });
-              show('mfaW-step2');
-            } else {
-              e.innerText = r.err || 'Kód nesouhlasí.'; e.style.display = '';
-            }
-          } catch { e.innerText='Chyba sítě.'; e.style.display=''; }
-        },
-
-        confirmSaved: function(){
-          const e = $('mfaW-err2'); e.style.display='none';
-          if (!$('mfaW-saved').checked){
-            e.innerText = 'Potvrďte prosím, že jste si kódy uložili.'; e.style.display='';
-            return;
-          }
-          show('mfaW-step3');
-          setTimeout(()=> $('mfaW-backup').focus(), 80);
-        },
-
-        verifyBackup: async function(){
-          const code = $('mfaW-backup').value.trim();
-          const e = $('mfaW-err3'); e.style.display='none';
-          if (!code){ e.innerText='Zadejte kód.'; e.style.display=''; return; }
-          try {
-            const r = await post('/TwoFA/VerifyBackupJson', { code });
-            if (r.ok){
-              show('mfaW-step4');
-            } else {
-              e.innerText = r.err || 'Neplatný kód.'; e.style.display='';
-            }
-          } catch { e.innerText='Chyba sítě.'; e.style.display=''; }
-        },
-
-        afterFinish: function(){
-          // pokud chceš hned přepnout UI na „Vypnout 2FA“, tady udělej refresh:
-          // location.reload();
-        }
-      };
-    })();
-</script>
-
+<form id="af-login" style="display:none">
+    @Html.AntiForgeryToken()
+</form>
 
 @RenderSection("Scripts", required: false)
 @RenderSection("Styles", required: false)

@@ -1,3 +1,5 @@
+﻿// MfaTotpPoskytovatel.cs
+using OtpNet;
 using System;
 using System.Security.Cryptography;
 using System.Text;
@@ -7,22 +9,14 @@ namespace Datona.Web.Code.Security
 {
     public interface ITotpService
     {
-        string GenerateSecret(int bytes = 20);
-        string BuildOtpAuthUri(string issuer, string label, string secretBase32, int digits, int period);
+        string GenerateSecret(int size = 20);
+        string BuildOtpAuthUri(string issuer, string label, string secretBase32, int period = 30, int digits = 6);
+        bool ValidateCode(string secret, string code);
         string FormatManualKey(string secretBase32);
-        bool ValidateCode(string secretBase32, string code);
-        byte[] BuildMetaPayload(string secret, string issuer, string label, int period, int digits);
-        (string secret, string issuer, string label, int period, int digits) ParseMetaPayload(byte[] protectedData);
+        (string secret, string issuer, string label, int period, int digits) ParseMeta(string metaJson);
     }
-
-    /// <summary>
-    /// TOTP provider (RFC 6238). Base32 secret, otpauth URI (Google Key URI Format),
-    /// základní validace s oknem ±1 kroku.
-    /// </summary>
     public sealed class MfaTotpPoskytovatel : ITotpService
     {
-        // --- Public API ---
-
         public string GenerateSecret(int bytes = 20)
         {
             var b = new byte[bytes];
@@ -32,18 +26,13 @@ namespace Datona.Web.Code.Security
 
         public string BuildOtpAuthUri(string issuer, string label, string secretBase32, int digits, int period)
         {
-            // otpauth://totp/{label}?secret=...&issuer=...&period=...&digits=...
-            // Google Key URI Format
-            var encLabel = Uri.EscapeDataString(label ?? "");
-            var encIssuer = Uri.EscapeDataString(issuer ?? "");
-            return $"otpauth://totp/{encIssuer}:{encLabel}?secret={secretBase32}&issuer={encIssuer}&period={period}&digits={digits}";
+            return $"otpauth://totp/{Uri.EscapeDataString(label)}?secret={secretBase32}&issuer={Uri.EscapeDataString(issuer)}&period={period}&digits={digits}";
         }
 
         public string FormatManualKey(string secretBase32)
         {
-            // jen pro čitelné opsání – NEumožňuje zadat vlastní secret
-            var s = (secretBase32 ?? string.Empty).Replace(" ", "").ToUpperInvariant();
-            var sb = new StringBuilder(s.Length + s.Length / 4);
+            var s = secretBase32.Replace(" ", "").ToUpperInvariant();
+            var sb = new StringBuilder();
             for (int i = 0; i < s.Length; i++)
             {
                 if (i > 0 && i % 4 == 0) sb.Append(' ');
@@ -54,96 +43,90 @@ namespace Datona.Web.Code.Security
 
         public bool ValidateCode(string secretBase32, string code)
         {
-            if (string.IsNullOrWhiteSpace(secretBase32) || string.IsNullOrWhiteSpace(code))
-                return false;
+            if (string.IsNullOrWhiteSpace(code)) return false;
+            code = code.Trim(); // nikdy nepřevádět na číslo!
+            if (code.Length < 6 || code.Length > 8) return false;
+            foreach (var ch in code) if (ch < '0' || ch > '9') return false;
 
-            // standardně 30 s; číslice vezmeme z délky kódu (obvykle 6)
-            int period = 30;
-            int digits = Math.Clamp(code.Length, 6, 8);
-            int window = 1; // povol ±1 krok
+            var key = Base32Decode(secretBase32);
+            const int period = 30;
+            const int digits = 6;
+            const int window = 1; // ±1 krok
 
-            var secret = Base32Decode(secretBase32);
-            var now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-            var timestep = now / period;
-
-            for (long w = -window; w <= window; w++)
+            long timestep = GetUnixTimeStep(period);
+            for (long offset = -window; offset <= window; offset++)
             {
-                var otp = ComputeTotp(secret, timestep + w, digits);
-                if (TimingSafeEquals(code, otp))
-                    return true;
+                var expected = ComputeTotp(key, timestep + offset, digits);
+                if (SecureEquals(expected, code)) return true;
             }
             return false;
         }
-        public byte[] BuildMetaPayload(string secret, string issuer, string label, int period, int digits)
-        {
-            var json = JsonSerializer.Serialize(new
-            {
-                secret = secret ?? "",
-                issuer = issuer ?? "",
-                label = label ?? "",
-                period,
-                digits
-            });
-            return Encoding.UTF8.GetBytes(json);
-        }
 
-        public (string secret, string issuer, string label, int period, int digits) ParseMetaPayload(byte[] protectedData)
+        public (string secret, string issuer, string label, int period, int digits) ParseMeta(string metaJson)
         {
-            var json = Encoding.UTF8.GetString(protectedData ?? Array.Empty<byte>());
-            using var doc = JsonDocument.Parse(json);
+            using var doc = JsonDocument.Parse(metaJson);
             var r = doc.RootElement;
-
-            string secret = r.TryGetProperty("secret", out var p0) ? p0.GetString() ?? "" : "";
-            string issuer = r.TryGetProperty("issuer", out var p1) ? p1.GetString() ?? "" : "";
-            string label = r.TryGetProperty("label", out var p2) ? p2.GetString() ?? "" : "";
-            int period = r.TryGetProperty("period", out var p3) ? p3.GetInt32() : 30;
-            int digits = r.TryGetProperty("digits", out var p4) ? p4.GetInt32() : 6;
-
-            return (secret, issuer, label, period, digits);
+            return (
+                r.GetProperty("secret_p").GetString()!,
+                r.GetProperty("issuer").GetString()!,
+                r.GetProperty("label").GetString()!,
+                r.GetProperty("period").GetInt32(),
+                r.GetProperty("digits").GetInt32()
+            );
         }
 
-        // --- Internals ---
-
-        private static string ComputeTotp(byte[] key, long counter, int digits)
+        public string BuildMetaJson(string secret, string issuer, string label, int period, int digits)
         {
-            Span<byte> c = stackalloc byte[8];
-            // big-endian
+            return JsonSerializer.Serialize(new { secret, issuer, label, period, digits });
+        }
+
+        // ---- helpers ----
+        private static long GetUnixTimeStep(int period)
+        {
+            var seconds = (long)(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            return seconds / period;
+        }
+
+        private static string ComputeTotp(byte[] key, long timestep, int digits)
+        {
+            Span<byte> msg = stackalloc byte[8];
             for (int i = 7; i >= 0; i--)
             {
-                c[i] = (byte)(counter & 0xFF);
-                counter >>= 8;
+                msg[i] = (byte)(timestep & 0xFF);
+                timestep >>= 8;
             }
 
-            Span<byte> hmac = stackalloc byte[20];
-            using (var h = new HMACSHA1(key))
+            Span<byte> hash = stackalloc byte[20];
+            using (var hmac = new HMACSHA1(key))
             {
-                h.TryComputeHash(c, hmac, out _);
+                var full = hmac.ComputeHash(msg.ToArray());
+                full.AsSpan().Slice(full.Length - 20, 20).CopyTo(hash); // HMACSHA1 vrací 20B
             }
 
-            int offset = hmac[hmac.Length - 1] & 0x0F;
-            int binCode = ((hmac[offset] & 0x7F) << 24)
-                        | ((hmac[offset + 1] & 0xFF) << 16)
-                        | ((hmac[offset + 2] & 0xFF) << 8)
-                        | (hmac[offset + 3] & 0xFF);
+            int offset = hash[hash.Length - 1] & 0x0F;
+            int binary =
+                ((hash[offset] & 0x7F) << 24) |
+                ((hash[offset + 1] & 0xFF) << 16) |
+                ((hash[offset + 2] & 0xFF) << 8) |
+                (hash[offset + 3] & 0xFF);
 
-            int mod = (int)Math.Pow(10, digits);
-            int val = binCode % mod;
-            return val.ToString(new string('0', digits));
+            int otp = binary % (int)Math.Pow(10, digits);
+            return otp.ToString().PadLeft(digits, '0');
         }
 
-        private static bool TimingSafeEquals(string a, string b)
+        private static bool SecureEquals(string a, string b)
         {
             if (a.Length != b.Length) return false;
-            int diff = 0;
-            for (int i = 0; i < a.Length; i++) diff |= a[i] ^ b[i];
-            return diff == 0;
+            var result = 0;
+            for (int i = 0; i < a.Length; i++)
+                result |= a[i] ^ b[i];
+            return result == 0;
         }
 
-        // Base32 (RFC 4648 bez paddingu) — pro TOTP secret stačí
         private static string Base32Encode(byte[] data)
         {
             const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-            var output = new StringBuilder((data.Length * 8 + 4) / 5);
+            var output = new StringBuilder();
             int bits = 0, value = 0;
             foreach (var b in data)
             {
@@ -159,30 +142,28 @@ namespace Datona.Web.Code.Security
             return output.ToString();
         }
 
-        private static byte[] Base32Decode(string input)
+        private static byte[] Base32Decode(string s)
         {
-            if (string.IsNullOrWhiteSpace(input)) return Array.Empty<byte>();
+            if (string.IsNullOrWhiteSpace(s)) return Array.Empty<byte>();
+            s = s.Trim().Replace(" ", "").Replace("=", "").ToUpperInvariant();
             const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-            var s = input.Trim().Replace(" ", "").TrimEnd('=').ToUpperInvariant();
-            int byteCount = s.Length * 5 / 8;
-            byte[] result = new byte[byteCount];
+            var bytes = new System.Collections.Generic.List<byte>(s.Length * 5 / 8);
+            int bits = 0, value = 0;
 
-            int buffer = 0, bitsLeft = 0, index = 0;
             foreach (char c in s)
             {
-                int val = alphabet.IndexOf(c);
-                if (val < 0) continue; // ignoruj nepovolené znaky (např. separátory)
-                buffer = (buffer << 5) | val;
-                bitsLeft += 5;
-                if (bitsLeft >= 8)
+                int idx = alphabet.IndexOf(c);
+                if (idx < 0) continue; // ignoruj nevalidní znaky/spacery
+                value = (value << 5) | idx;
+                bits += 5;
+                if (bits >= 8)
                 {
-                    result[index++] = (byte)((buffer >> (bitsLeft - 8)) & 0xFF);
-                    bitsLeft -= 8;
-                    if (index == result.Length) break;
+                    bytes.Add((byte)((value >> (bits - 8)) & 0xFF));
+                    bits -= 8;
                 }
             }
-            return result;
+            return bytes.ToArray();
         }
     }
 }

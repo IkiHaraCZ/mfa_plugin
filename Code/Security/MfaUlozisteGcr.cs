@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.Linq;
-using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http;
@@ -13,7 +12,7 @@ namespace Datona.Web.Code.Security
 {
     public sealed class MfaUlozisteGcr : IMfaStore
     {
-        private readonly Datona.Web.Code.GcrHelper _gcrHelper;
+        private readonly GcrHelper _gcrHelper;
         private readonly IHttpContextAccessor _http;
 
         // --- Konstanty pro nové číselníky ---
@@ -23,7 +22,7 @@ namespace Datona.Web.Code.Security
         private const int ST_AKTIVNI = 3;
         private const int ST_ZRUSENO = 4;
 
-        public MfaUlozisteGcr(Datona.Web.Code.GcrHelper gcrHelper, IHttpContextAccessor http)
+        public MfaUlozisteGcr(GcrHelper gcrHelper, IHttpContextAccessor http)
         {
             _gcrHelper = gcrHelper;
             _http = http;
@@ -148,7 +147,7 @@ namespace Datona.Web.Code.Security
         public Task<bool> HasAnyActiveMethodAsync(long userId)
         {
             var v = ExecScalar(
-                @$"SELECT 1
+                @$"SELECT mfa_metody2loginentity_id
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
                      AND mfa_status_ciselnik_id={ST_AKTIVNI}
@@ -225,7 +224,6 @@ namespace Datona.Web.Code.Security
         // ---------- Parametry & mapování ----------
 
         private static NpgsqlParameter P(string name, object value) => new(name, value ?? DBNull.Value);
-        private static NpgsqlParameter PV(string name, object? value) => new(name, value ?? DBNull.Value);
         private static NpgsqlParameter PJ(string name, object? json)
         {
             var p = new NpgsqlParameter(name, NpgsqlTypes.NpgsqlDbType.Jsonb) { Value = json ?? DBNull.Value };
