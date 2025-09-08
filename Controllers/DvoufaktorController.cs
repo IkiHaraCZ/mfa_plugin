@@ -1,7 +1,6 @@
-﻿using System;
+using System;
 using System.Linq;
 using System.Text.Json;
-using System.Threading.Tasks;
 using Datona.MobilniCisnik.Server;
 using Datona.Web.Code;
 using Datona.Web.Code.Security;
@@ -17,7 +16,7 @@ namespace Datona.Web.Controllers
         private readonly ITotpService _totp;
         private readonly ISecretProtector _protector;
         private readonly IBackupCodeService _backup;
-        private readonly MfaPozadavkyVolby _opts;
+        private readonly MfaVolby _opts;
         private readonly GcrHelper _gcr;
         private readonly ILogger<DvoufaktorController> _log;
 
@@ -26,7 +25,7 @@ namespace Datona.Web.Controllers
             ITotpService totp,
             ISecretProtector protector,
             IBackupCodeService backup,
-            MfaPozadavkyVolby opts,
+            MfaVolby opts,
             GcrHelper gcr,
             ILogger<DvoufaktorController> log)
         {
@@ -39,12 +38,13 @@ namespace Datona.Web.Controllers
             _log = log;
         }
 
-        // Pomocně: aktuální loginentity_id
+        // --- helpers ---
         private long GetCurrentUserIdOrThrow()
         {
             var aspx = Request.Cookies[".ASPXAUTH"];
             var ac = !string.IsNullOrEmpty(aspx) ? AuthCookie.AuthenticationClaim(aspx) : null;
             if (ac == null) throw new InvalidOperationException("Nejste přihlášen.");
+
             var inst = _gcr.Instance(new UserContext
             {
                 Login = ac.UserName,
@@ -55,47 +55,39 @@ namespace Datona.Web.Controllers
                 Guid_externi_db = ac.Guid_externi_db
             });
             if (inst == null) throw new InvalidOperationException("Nelze získat GCR instanci.");
+
             return inst.GetLoginentityId();
         }
 
         private string ClientIp() => HttpContext?.Connection?.RemoteIpAddress?.ToString() ?? "";
         private string UserAgent() => Request?.Headers["User-Agent"].ToString() ?? "";
 
-        // STEP 1: zahájit nastavení – vytvoří PENDING TOTP metodu, vrátí QR a „manual“ string (jen k opsání, ne vlastní secret)
+        // KROK 1: start – vytvoří pending TOTP, vrátí QR + „manual key“ (read-only)
         [HttpPost("start")]
-        public async Task<IActionResult> Start()
+        public IActionResult Start()
         {
             try
             {
                 var userId = GetCurrentUserIdOrThrow();
 
-                // Pokud už má aktivní metodu, vrať informaci (tlačítko v UI se má stejně zobrazovat jen pokud není 2FA nastaveno)
-                if (await _store.HasAnyActiveMethodAsync(userId))
+                var hasActive = _store.HasAnyActiveMethodAsync(userId).GetAwaiter().GetResult();
+                if (hasActive)
                     return Json(new { ok = false, error = "Už máte aktivní 2FA." });
 
-                // vygenerovat secret a metadata
                 var secret = _totp.GenerateSecret();
                 var label = $"{_opts.Issuer}:{userId}";
-                var metaJson = _totp.BuildMetaJson(secret, _opts.Issuer, label, period: 30, digits: 6);
+                var metaJson = _totp.BuildMetaPayload(secret, _opts.Issuer, label, period: 30, digits: 6);
 
-                // uložit pending metodu
-                var methodId = await _store.CreatePendingTotpAsync(userId, _protector.Protect(metaJson));
+                var methodId = _store.CreatePendingTotpAsync(userId, _protector.Protect(metaJson)).GetAwaiter().GetResult();
 
-                // QR/URI
                 var otpAuthUri = _totp.BuildOtpAuthUri(_opts.Issuer, label, secret, digits: 6, period: 30);
-                // QR controller už v projektu máš: /qr/otp?data=...&size=240
                 var qrUrl = Url.Content($"/qr/otp?data={Uri.EscapeDataString(otpAuthUri)}&size=240");
                 var manual = _totp.FormatManualKey(secret);
 
-                await _store.InsertAuditAsync(userId, "mfa.start", ClientIp(), UserAgent(), new { methodId });
+                _store.InsertAuditAsync(userId, "mfa.start", ClientIp(), UserAgent(), new { methodId })
+                      .GetAwaiter().GetResult();
 
-                return Json(new
-                {
-                    ok = true,
-                    methodId,
-                    qrUrl,
-                    manualKey = manual
-                });
+                return Json(new { ok = true, methodId, qrUrl, manualKey = manual });
             }
             catch (Exception ex)
             {
@@ -104,29 +96,31 @@ namespace Datona.Web.Controllers
             }
         }
 
-        // STEP 1b: ověř TOTP kód proti pending metodě
+        // KROK 1b: ověř TOTP proti pending metodě
         [HttpPost("verify-totp")]
-        public async Task<IActionResult> VerifyTotp([FromForm] long methodId, [FromForm] string code)
+        public IActionResult VerifyTotp([FromForm] long methodId, [FromForm] string code)
         {
             try
             {
                 var userId = GetCurrentUserIdOrThrow();
-                var method = await _store.GetLatestPendingTotpAsync(userId);
+                var method = _store.GetLatestPendingTotpAsync(userId).GetAwaiter().GetResult();
                 if (method == null || method.Id != methodId)
                     return Json(new { ok = false, error = "Metoda nenalezena nebo už není v nastavení." });
 
-                // rozbal meta
                 var metaProtected = method.MetaJson;
                 var metaJson = _protector.Unprotect(metaProtected);
-                var (secret, issuer, label, period, digits) = _totp.ParseMeta(metaJson);
+                var (secret, issuer, label, period, digits) = _totp.ParseMetaPayload(metaJson);
 
                 if (!_totp.ValidateCode(secret, code))
                 {
-                    await _store.InsertAuditAsync(userId, "mfa.verify_totp_fail", ClientIp(), UserAgent(), new { methodId });
+                    _store.InsertAuditAsync(userId, "mfa.verify_totp_fail", ClientIp(), UserAgent(), new { methodId })
+                          .GetAwaiter().GetResult();
                     return Json(new { ok = false, error = "Kód nesouhlasí." });
                 }
 
-                await _store.InsertAuditAsync(userId, "mfa.verify_totp_ok", ClientIp(), UserAgent(), new { methodId });
+                _store.InsertAuditAsync(userId, "mfa.verify_totp_ok", ClientIp(), UserAgent(), new { methodId })
+                      .GetAwaiter().GetResult();
+
                 return Json(new { ok = true });
             }
             catch (Exception ex)
@@ -136,22 +130,22 @@ namespace Datona.Web.Controllers
             }
         }
 
-        // STEP 2: vygeneruj batch záložních kódů (uloží se jen hash, plaintext pošleme jednou)
+        // KROK 2: vygeneruj záložní kódy (uloží se jen hash; plaintext vracíme teď)
         [HttpPost("generate-backups")]
-        public async Task<IActionResult> GenerateBackups([FromForm] long methodId)
+        public IActionResult GenerateBackups([FromForm] long methodId)
         {
             try
             {
                 var userId = GetCurrentUserIdOrThrow();
 
-                // čistka nepoužitých předchozích batchů
-                await _store.RemoveUnusedBackupCodesAsync(userId);
+                _store.RemoveUnusedBackupCodesAsync(userId).GetAwaiter().GetResult();
+                var codes = _backup.GenerateBatch();
+                var plain = codes.plain;
+                var hashed = codes.hashed;
+                _store.InsertBackupCodesAsync(userId, hashed).GetAwaiter().GetResult();
 
-                var plain = _backup.GeneratePlaintextCodes(_opts.BackupCodesCount).ToList();
-                var hashed = plain.Select(_backup.Hash).ToList();
-                await _store.InsertBackupCodesAsync(userId, hashed);
-
-                await _store.InsertAuditAsync(userId, "mfa.backups_generated", ClientIp(), UserAgent(), new { methodId, count = plain.Count });
+                _store.InsertAuditAsync(userId, "mfa.backups_generated", ClientIp(), UserAgent(), new { methodId, count = plain.Count })
+                      .GetAwaiter().GetResult();
 
                 return Json(new { ok = true, codes = plain });
             }
@@ -162,14 +156,15 @@ namespace Datona.Web.Controllers
             }
         }
 
-        // STEP 3: potvrď, že si je uživatel uložil (jen audit + server nic nemaže)
+        // KROK 3: potvrď, že si je uživatel uložil
         [HttpPost("confirm-saved")]
-        public async Task<IActionResult> ConfirmSaved([FromForm] long methodId)
+        public IActionResult ConfirmSaved([FromForm] long methodId)
         {
             try
             {
                 var userId = GetCurrentUserIdOrThrow();
-                await _store.InsertAuditAsync(userId, "mfa.backups_confirmed", ClientIp(), UserAgent(), new { methodId });
+                _store.InsertAuditAsync(userId, "mfa.backups_confirmed", ClientIp(), UserAgent(), new { methodId })
+                      .GetAwaiter().GetResult();
                 return Json(new { ok = true });
             }
             catch (Exception ex)
@@ -179,22 +174,24 @@ namespace Datona.Web.Controllers
             }
         }
 
-        // STEP 3b: ověř jeden záložní kód (NEspotřebovat! pouze ověřit — musí projít hashovaným porovnáním)
+        // KROK 3b: ověř jeden záložní kód (NEspotřebovat – jen ověřit proti hashům)
         [HttpPost("verify-backup")]
-        public async Task<IActionResult> VerifyBackup([FromForm] long methodId, [FromForm] string code)
+        public IActionResult VerifyBackup([FromForm] long methodId, [FromForm] string code)
         {
             try
             {
                 var userId = GetCurrentUserIdOrThrow();
-                var all = await _store.GetUnusedBackupCodesAsync(userId);
+                var all = _store.GetUnusedBackupCodesAsync(userId).GetAwaiter().GetResult();
                 var ok = all.Any(x => _backup.Verify(code, x.CodeHash));
                 if (!ok)
                 {
-                    await _store.InsertAuditAsync(userId, "mfa.verify_backup_fail", ClientIp(), UserAgent(), new { methodId });
+                    _store.InsertAuditAsync(userId, "mfa.verify_backup_fail", ClientIp(), UserAgent(), new { methodId })
+                          .GetAwaiter().GetResult();
                     return Json(new { ok = false, error = "Zadaný záložní kód není z této dávky." });
                 }
 
-                await _store.InsertAuditAsync(userId, "mfa.verify_backup_ok", ClientIp(), UserAgent(), new { methodId });
+                _store.InsertAuditAsync(userId, "mfa.verify_backup_ok", ClientIp(), UserAgent(), new { methodId })
+                      .GetAwaiter().GetResult();
                 return Json(new { ok = true });
             }
             catch (Exception ex)
@@ -204,15 +201,16 @@ namespace Datona.Web.Controllers
             }
         }
 
-        // STEP 4: aktivuj metodu (Pending -> Active)
+        // KROK 4: aktivace metody
         [HttpPost("activate")]
-        public async Task<IActionResult> Activate([FromForm] long methodId)
+        public IActionResult Activate([FromForm] long methodId)
         {
             try
             {
                 var userId = GetCurrentUserIdOrThrow();
-                await _store.ActivateMethodAsync(methodId);
-                await _store.InsertAuditAsync(userId, "mfa.activated", ClientIp(), UserAgent(), new { methodId });
+                _store.ActivateMethodAsync(methodId).GetAwaiter().GetResult();
+                _store.InsertAuditAsync(userId, "mfa.activated", ClientIp(), UserAgent(), new { methodId })
+                      .GetAwaiter().GetResult();
                 return Json(new { ok = true });
             }
             catch (Exception ex)
