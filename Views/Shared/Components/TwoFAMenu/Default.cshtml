@@ -1,0 +1,34 @@
+﻿@model Datona.Web.Components.TwoFaMenuViewComponent.TwoFaMenuVM
+@inject Datona.MobilniCisnik.Web.Code.Localization L
+
+@if (Model?.LoggedIn == true)
+{
+    <!-- Anti-forgery jen pro jistotu (použije si ho JS) -->
+    <form id="twofa-af-form" style="display:none">@Html.AntiForgeryToken()</form>
+
+    @if (!Model.Has2FA)
+    {
+        <a class="dropdown-item" href="javascript:void(0)" onclick="if(window.MFAW){MFAW.open();}"><span>🔐 @L.GetResource("Layout_Nastavit2FA")</span></a>
+    }
+    else
+    {
+        <a class="dropdown-item text-danger" href="javascript:void(0)" onclick="twofaDisableConfirm()"><span>❌ @L.GetResource("Layout_Vypnout2FA")</span></a>
+
+        <script>
+            function twofaDisableConfirm(){
+                if (!confirm('@(L.GetResource("TwoFA_SkutecneVypnout") ?? "Opravdu vypnout 2FA?")')) return;
+                const form = document.getElementById('twofa-af-form');
+                const token = form ? form.querySelector('input[name="__RequestVerificationToken"]')?.value : null;
+                const body = new URLSearchParams();
+                if (token) body.append('__RequestVerificationToken', token);
+                fetch('/TwoFA/VypnoutJson', { method: 'POST', headers:{'Accept':'application/json'}, body })
+                  .then(r => r.json())
+                  .then(j => {
+                      if (j && j.ok){ location.reload(); }
+                      else { alert((j && j.err) || 'Chyba při vypínání 2FA.'); }
+                  })
+                  .catch(() => alert('Chyba sítě.'));
+            }
+        </script>
+    }
+}

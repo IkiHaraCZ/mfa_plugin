@@ -1,6 +1,8 @@
-using Datona.MobilniCisnik.Server;
+﻿using Datona.MobilniCisnik.Server;
+using Datona.MobilniCisnik.Web.Code;
 using Datona.Web.Code;
 using Datona.Web.Code.Security;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
 using System;
@@ -143,7 +145,7 @@ namespace Datona.Web.Controllers
                 var codes = _backup.GenerateBatch();
                 var plainCodes = codes.plain;
                 var hashed = codes.hashed;
-                _store.InsertBackupCodesAsync(userId, hashed).GetAwaiter().GetResult();
+                _store.InsertBackupCodesAsync(userId, hashed).GetAwaiter().GetResult(); 
 
                 _store.InsertAuditAsync(userId, "mfa.backups_generated", ClientIp(), UserAgent(), new { method.Id, count = plainCodes.Count })
                       .GetAwaiter().GetResult();
@@ -183,6 +185,96 @@ namespace Datona.Web.Controllers
             catch (Exception ex)
             {
                 _log.LogError(ex, "TwoFA VerifyBackupJson error");
+                return Json(new { ok = false, err = ex.Message });
+            }
+        }
+
+        // Controllers/DvoufaktorController.cs (výřez)
+        [ValidateAntiForgeryToken]
+        [HttpPost]
+        public IActionResult LoginVerifyJson(string code)
+        {
+            try
+            {
+                var s = HttpContext.Session.GetString("MFA_PENDING_LOGIN");
+                if (string.IsNullOrWhiteSpace(s))
+                    return Json(new { ok = false, err = "Sezení vypršelo, zkuste se přihlásit znovu." });
+
+                // rozbalit pending
+                dynamic pending = Newtonsoft.Json.JsonConvert.DeserializeObject(s);
+                if (pending == null || DateTime.UtcNow > (DateTime)pending.ExpiresUtc)
+                {
+                    HttpContext.Session.Remove("MFA_PENDING_LOGIN");
+                    return Json(new { ok = false, err = "Sezení vypršelo, zkuste se přihlásit znovu." });
+                }
+
+                long loginentityId = (long)pending.loginentityId;
+                // 1) zkus TOTP
+                var method = _store.GetActiveTotpAsync(loginentityId).Result;
+                bool ok = false;
+                if (method != null)
+                {
+                    var meta = _totp.ParseMetaPayload(Encoding.UTF8.GetBytes(method.MetaJson));
+                    ok = _totp.ValidateCode(meta.secret, code);
+                }
+
+                // 2) pokud TOTP neprojde, zkus záložní kód
+                if (!ok)
+                {
+                    var codes = _store.GetUnusedBackupCodesAsync(loginentityId).Result;
+                    var match = codes.FirstOrDefault(c => _backup.Verify(code, c.CodeHash));
+                    if (match != null)
+                    {
+                        // Tady jsme v LOGINu, takže jej normálně označíme jako použitý:
+                        _store.MarkBackupCodeUsedAsync(match.Id, DateTime.Now).Wait();
+                        ok = true;
+                    }
+                }
+
+                if (!ok)
+                    return Json(new { ok = false, err = "Neplatný kód. Zkuste znovu." });
+
+                // 3) úspěch → vytvoř .ASPXAUTH podle tvého původního flow
+                HttpContext.Session.Remove("MFA_PENDING_LOGIN");
+
+                string macAddress = "00-0C-E3-24-5A-CC"; // jak používáš v HomeControlleru
+                var expiresInMinutes = 240;
+                string ipAddress = Request.HttpContext.Connection.RemoteIpAddress?.ToString() ?? "";
+
+                // GCR Instance se stejnými údaji jako při hesle:
+                var gcrInstance = _gcr.Instance(new UserContext
+                {
+                    Login = (string)pending.Login,
+                    HesloMD5 = (string)pending.HesloMD5,
+                    InstanceId = (long)pending.InstanceId,
+                    language_id = "1",
+                    Guid_externi_db = (string)pending.Guid_externi_db
+                });
+
+                // ticket + cookie
+                var ticket = AuthCookie.GetCookieTicket(
+                    (string)pending.Login, (string)pending.HesloMD5, macAddress,
+                    ((long)pending.loginentityId).ToString(), expiresInMinutes, (long)pending.InstanceId);
+
+                var aspxAuth = AuthCookie.Encrypt(ticket);
+
+                if (gcrInstance.vytvor_online_session(aspxAuth, (long)pending.loginentityId, ticket.ExpiresUtc, expiresInMinutes, ipAddress, null))
+                {
+                    Response.Cookies.Append(".ASPXAUTH", aspxAuth, new CookieOptions()
+                    {
+                        Expires = ticket.ExpiresUtc,
+                        Path = ticket.CookiePath
+                    });
+                    var redirect = (string)pending.ReturnUrl;
+                    return Json(new { ok = true, redirect = string.IsNullOrWhiteSpace(redirect) ? "/" : redirect });
+                }
+                else
+                {
+                    return Json(new { ok = false, err = "Chyba při založení session." });
+                }
+            }
+            catch (Exception ex)
+            {
                 return Json(new { ok = false, err = ex.Message });
             }
         }
