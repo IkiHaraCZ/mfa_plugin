@@ -1,6 +1,8 @@
 ﻿// MfaTotpPoskytovatel.cs
+using Microsoft.AspNetCore.DataProtection;
 using OtpNet;
 using System;
+using System.Collections.Generic;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -20,8 +22,8 @@ namespace Datona.Web.Code.Security
         public string GenerateSecret(int bytes = 20)
         {
             var b = new byte[bytes];
-            RandomNumberGenerator.Fill(b);
-            return Base32Encode(b);
+            RandomNumberGenerator.Fill(b);  //přesuneme do sql
+            return Base32Encoding.ToString(b);
         }
 
         public string BuildOtpAuthUri(string issuer, string label, string secretBase32, int digits, int period)
@@ -48,7 +50,7 @@ namespace Datona.Web.Code.Security
             if (code.Length < 6 || code.Length > 8) return false;
             foreach (var ch in code) if (ch < '0' || ch > '9') return false;
 
-            var key = Base32Decode(secretBase32);
+            var key = Base32Encoding.ToBytes(secretBase32);
             const int period = 30;
             const int digits = 6;
             const int window = 1; // ±1 krok
@@ -73,11 +75,6 @@ namespace Datona.Web.Code.Security
                 r.GetProperty("period").GetInt32(),
                 r.GetProperty("digits").GetInt32()
             );
-        }
-
-        public string BuildMetaJson(string secret, string issuer, string label, int period, int digits)
-        {
-            return JsonSerializer.Serialize(new { secret, issuer, label, period, digits });
         }
 
         // ---- helpers ----
@@ -122,48 +119,65 @@ namespace Datona.Web.Code.Security
                 result |= a[i] ^ b[i];
             return result == 0;
         }
+    }
 
-        private static string Base32Encode(byte[] data)
+    public interface IBackupCodeService
+    {
+        (List<string> plain, List<string> hashed) GenerateBatch(int count = 10);
+        bool Verify(string plain, string hash);
+    }
+
+    public sealed class MfaZalozniKody : IBackupCodeService
+    {
+        public (List<string> plain, List<string> hashed) GenerateBatch(int count = 10)
         {
-            const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-            var output = new StringBuilder();
-            int bits = 0, value = 0;
-            foreach (var b in data)
+            var plain = new List<string>(count);
+            var hashed = new List<string>(count);
+
+            for (int i = 0; i < count; i++)
             {
-                value = (value << 8) | b;
-                bits += 8;
-                while (bits >= 5)
-                {
-                    output.Append(alphabet[(value >> (bits - 5)) & 31]);
-                    bits -= 5;
-                }
+                var code = GenerateCode();
+                plain.Add(code);
+                hashed.Add(BCrypt.Net.BCrypt.HashPassword(code));
             }
-            if (bits > 0) output.Append(alphabet[(value << (5 - bits)) & 31]);
-            return output.ToString();
+            return (plain, hashed);
         }
 
-        private static byte[] Base32Decode(string s)
+        public bool Verify(string plain, string hash) => BCrypt.Net.BCrypt.Verify(plain ?? "", hash ?? "");
+
+        private static string GenerateCode()
         {
-            if (string.IsNullOrWhiteSpace(s)) return Array.Empty<byte>();
-            s = s.Trim().Replace(" ", "").Replace("=", "").ToUpperInvariant();
-            const string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+            const string A = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+            Span<char> raw = stackalloc char[12];
+            for (int i = 0; i < raw.Length; i++)
+                raw[i] = A[RandomNumberGenerator.GetInt32(A.Length)];
 
-            var bytes = new System.Collections.Generic.List<byte>(s.Length * 5 / 8);
-            int bits = 0, value = 0;
-
-            foreach (char c in s)
+            // formát XXXX-XXXX-XXXX
+            return string.Create(14, raw.ToArray(), (dst, src) =>
             {
-                int idx = alphabet.IndexOf(c);
-                if (idx < 0) continue; // ignoruj nevalidní znaky/spacery
-                value = (value << 5) | idx;
-                bits += 5;
-                if (bits >= 8)
-                {
-                    bytes.Add((byte)((value >> (bits - 8)) & 0xFF));
-                    bits -= 8;
-                }
-            }
-            return bytes.ToArray();
+                dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; dst[4] = '-';
+                dst[5] = src[4]; dst[6] = src[5]; dst[7] = src[6]; dst[8] = src[7]; dst[9] = '-';
+                dst[10] = src[8]; dst[11] = src[9]; dst[12] = src[10]; dst[13] = src[11];
+            });
         }
+    }
+
+    public interface ISecretProtector
+    {
+        string Protect(byte[] plaintext);
+        byte[] Unprotect(string protectedBase64);
+    }
+
+    public sealed class MfaOchranaTajemstvi : ISecretProtector
+    {
+        private readonly IDataProtector _dp;
+        public MfaOchranaTajemstvi(IDataProtectionProvider provider)
+        {
+            _dp = provider.CreateProtector("twofa/secrets/v1");
+        }
+
+        public string Protect(byte[] plaintext) => Convert.ToBase64String(_dp.Protect(plaintext));
+
+        public byte[] Unprotect(string protectedBase64) => _dp.Unprotect(Convert.FromBase64String(protectedBase64 ?? ""));
     }
 }

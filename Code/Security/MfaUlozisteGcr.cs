@@ -1,26 +1,76 @@
-﻿using System;
+﻿using Microsoft.AspNetCore.Http;
+using Npgsql;
+using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Globalization;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
-using Npgsql;
+using static Datona.Web.Code.Security.MfaUlozisteGcr;
 
 namespace Datona.Web.Code.Security
 {
+    /// <summary>
+    /// Úložiště 2FA nad stávající DB (volání přes GcrHelper.ExecuteScalar/ExecuteNonQuery/select).
+    /// </summary>
+    public interface IMfaStore
+    {
+        Task<UserMfaMethod?> GetLatestPendingTotpAsync(long userId);
+        Task<UserMfaMethod?> GetActiveTotpAsync(long userId);
+        Task<long> CreatePendingTotpAsync(long userId, string metaJson);
+        Task ActivateMethodAsync(long methodId);
+        Task SetMethodLastUsedAsync(long methodId, DateTime whenUtc);
+
+        Task RemoveUnusedBackupCodesAsync(long userId);
+        Task InsertBackupCodesAsync(long userId, IEnumerable<string> hashed);
+        Task<IReadOnlyList<BackupCode>> GetUnusedBackupCodesAsync(long userId);
+        Task MarkBackupCodeUsedAsync(long backupId, DateTime whenUtc);
+
+        Task InsertAuditAsync(long? userId, string action, string? ip, string? ua, object? details);
+
+        /// <summary>Vrátí true, pokud má uživatel alespoň jednu aktivní 2FA metodu.</summary>
+        Task<bool> HasAnyActiveMethodAsync(long userId);
+
+        /// <summary>Deaktivuje všechny 2FA metody daného uživatele (pro „vypnout 2FA“).</summary>
+        Task<int> RevokeAllMethodsAsync(long userId);
+
+        /// <summary>Smaže všechny nepoužité záložní kódy (po vypnutí 2FA).</summary>
+        Task<int> DeleteAllBackupCodesAsync(long userId);
+    }
+
     public sealed class MfaUlozisteGcr : IMfaStore
     {
         private readonly GcrHelper _gcrHelper;
         private readonly IHttpContextAccessor _http;
 
-        // --- Konstanty pro nové číselníky ---
-        private const int TYP_TOTP = 1;           // dade.mfa_metody_typy: totp
-        private const int ST_ZALOZENO = 1;        // pending
-        private const int ST_ZASLANO = 2;        // pending (např. pro jiné metody)
-        private const int ST_AKTIVNI = 3;
-        private const int ST_ZRUSENO = 4;
+        // Typy metod 2FA – do budoucna rozšířitelné (WebAuthn, SMS…)
+        public enum MfaMethodType { TOTP = 1 }
+
+        // Stav metody 2FA
+        public enum MfaStatus { Zalozeno = 1, Zaslano = 2, Aktivni = 3, Zruseno = 4 }
+
+        // Záznam metody u uživatele (uložené v tabulce mfa_methods)
+        public sealed class UserMfaMethod
+        {
+            public long Id { get; init; }
+            public long UserId { get; init; }
+            public MfaMethodType Type { get; init; }
+            public MfaStatus Status { get; set; }
+            public DateTime CreatedAt { get; init; }
+            public DateTime? LastUsedAt { get; set; }
+            public string MetaJson { get; set; } = "{}";
+        }
+
+        // Záložní kód (tabulka mfa_backup_codes) – kód je ukládán jako hash
+        public sealed class BackupCode
+        {
+            public long Id { get; init; }
+            public long UserId { get; init; }
+            public string CodeHash { get; init; } = "";
+            public DateTime CreatedAt { get; init; }
+            public DateTime? UsedAt { get; set; }
+        }
 
         public MfaUlozisteGcr(GcrHelper gcrHelper, IHttpContextAccessor http)
         {
@@ -36,8 +86,8 @@ namespace Datona.Web.Code.Security
                 @$"SELECT *
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
-                     AND mfa_metody_typy_id={TYP_TOTP}
-                     AND mfa_status_ciselnik_id IN ({ST_ZALOZENO},{ST_ZASLANO})
+                     AND mfa_metody_typy_id={MfaMethodType.TOTP}
+                     AND mfa_status_ciselnik_id IN ({MfaStatus.Zalozeno},{MfaStatus.Zaslano})
                    ORDER BY mfa_metody2loginentity_id DESC
                    LIMIT 1",
                 P("u", userId))));
@@ -47,8 +97,8 @@ namespace Datona.Web.Code.Security
                 @$"SELECT *
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
-                     AND mfa_metody_typy_id={TYP_TOTP}
-                     AND mfa_status_ciselnik_id={ST_AKTIVNI}
+                     AND mfa_metody_typy_id={MfaMethodType.TOTP}
+                     AND mfa_status_ciselnik_id={MfaStatus.Aktivni}
                    ORDER BY mfa_metody2loginentity_id ASC
                    LIMIT 1",
                 P("u", userId))));
@@ -63,8 +113,8 @@ namespace Datona.Web.Code.Security
                     (@u, @typ, @st, @m, @t)
                   RETURNING mfa_metody2loginentity_id",
                 P("u", userId),
-                P("typ", TYP_TOTP),
-                P("st", ST_ZALOZENO),
+                P("typ", MfaMethodType.TOTP),
+                P("st", MfaStatus.Zalozeno),
                 PJ("m", metaJson),
                 P("t", DateTime.Now)      // TIMESTAMP bez TZ
             );
@@ -77,7 +127,7 @@ namespace Datona.Web.Code.Security
                 @"UPDATE dade.mfa_metody2loginentity
                     SET mfa_status_ciselnik_id=@st
                   WHERE mfa_metody2loginentity_id=@id",
-                P("st", ST_AKTIVNI), P("id", methodId));
+                P("st", MfaStatus.Aktivni), P("id", methodId));
             return Task.CompletedTask;
         }
 
@@ -150,7 +200,7 @@ namespace Datona.Web.Code.Security
                 @$"SELECT mfa_metody2loginentity_id
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
-                     AND mfa_status_ciselnik_id={ST_AKTIVNI}
+                     AND mfa_status_ciselnik_id={MfaStatus.Aktivni}
                    LIMIT 1",
                 P("u", userId));
             return Task.FromResult(v != null);
@@ -163,7 +213,7 @@ namespace Datona.Web.Code.Security
                     SET mfa_status_ciselnik_id=@st
                   WHERE loginentity_id=@u
                     AND mfa_status_ciselnik_id<>@st",
-                P("st", ST_ZRUSENO), P("u", userId));
+                P("st", MfaStatus.Zruseno), P("u", userId));
             return Task.FromResult(rows);
         }
 
