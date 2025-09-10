@@ -46,9 +46,14 @@ namespace Datona.Web.Code.Security
 
         // Typy metod 2FA – do budoucna rozšířitelné (WebAuthn, SMS…)
         public enum MfaMethodType { TOTP = 1 }
+        private int TYP_TOTP = 1;
 
         // Stav metody 2FA
         public enum MfaStatus { Zalozeno = 1, Zaslano = 2, Aktivni = 3, Zruseno = 4 }
+        private int ST_ZALOZENO = 1;
+        private int ST_ZASLANO = 2;
+        private int ST_AKTIVNI = 3;
+        private int ST_ZRUSENO = 4;
 
         // Záznam metody u uživatele (uložené v tabulce mfa_methods)
         public sealed class UserMfaMethod
@@ -86,8 +91,8 @@ namespace Datona.Web.Code.Security
                 @$"SELECT *
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
-                     AND mfa_metody_typy_id={MfaMethodType.TOTP}
-                     AND mfa_status_ciselnik_id IN ({MfaStatus.Zalozeno},{MfaStatus.Zaslano})
+                     AND mfa_metody_typy_id={TYP_TOTP}
+                     AND mfa_status_ciselnik_id IN ({ST_ZALOZENO},{ST_ZASLANO})
                    ORDER BY mfa_metody2loginentity_id DESC
                    LIMIT 1",
                 P("u", userId))));
@@ -97,8 +102,8 @@ namespace Datona.Web.Code.Security
                 @$"SELECT *
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
-                     AND mfa_metody_typy_id={MfaMethodType.TOTP}
-                     AND mfa_status_ciselnik_id={MfaStatus.Aktivni}
+                     AND mfa_metody_typy_id={TYP_TOTP}
+                     AND mfa_status_ciselnik_id={ST_AKTIVNI}
                    ORDER BY mfa_metody2loginentity_id ASC
                    LIMIT 1",
                 P("u", userId))));
@@ -113,8 +118,8 @@ namespace Datona.Web.Code.Security
                     (@u, @typ, @st, @m, @t)
                   RETURNING mfa_metody2loginentity_id",
                 P("u", userId),
-                P("typ", MfaMethodType.TOTP),
-                P("st", MfaStatus.Zalozeno),
+                P("typ", TYP_TOTP),
+                P("st", ST_ZALOZENO),
                 PJ("m", metaJson),
                 P("t", DateTime.Now)      // TIMESTAMP bez TZ
             );
@@ -127,7 +132,7 @@ namespace Datona.Web.Code.Security
                 @"UPDATE dade.mfa_metody2loginentity
                     SET mfa_status_ciselnik_id=@st
                   WHERE mfa_metody2loginentity_id=@id",
-                P("st", MfaStatus.Aktivni), P("id", methodId));
+                P("st", ST_AKTIVNI), P("id", methodId));
             return Task.CompletedTask;
         }
 
@@ -200,7 +205,7 @@ namespace Datona.Web.Code.Security
                 @$"SELECT mfa_metody2loginentity_id
                    FROM dade.mfa_metody2loginentity
                    WHERE loginentity_id=@u
-                     AND mfa_status_ciselnik_id={MfaStatus.Aktivni}
+                     AND mfa_status_ciselnik_id={ST_AKTIVNI}
                    LIMIT 1",
                 P("u", userId));
             return Task.FromResult(v != null);
@@ -213,7 +218,7 @@ namespace Datona.Web.Code.Security
                     SET mfa_status_ciselnik_id=@st
                   WHERE loginentity_id=@u
                     AND mfa_status_ciselnik_id<>@st",
-                P("st", MfaStatus.Zruseno), P("u", userId));
+                P("st", ST_ZRUSENO), P("u", userId));
             return Task.FromResult(rows);
         }
 
