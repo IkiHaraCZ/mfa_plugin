@@ -327,82 +327,52 @@
     </div>
 </div>
 
-<!-- 2FA Wizard Modal -->
-<script src="~/js/mfa-wizard-inline.js"></script>
-<div class="modal" id="mfaWizardModal" tabindex="-1" role="dialog" aria-hidden="true" style="z-index: 1100">
-    <div class="modal-dialog" role="document" style="max-width: 400px;">
+<!-- Modal shell -->
+<div id="mfaWizardModal" class="modal" tabindex="-1" role="dialog" style="z-index: 1050">
+    <div class="modal-dialog modal-full" role="document">
         <div class="modal-content shadow-lg border-primary">
             <div class="modal-header">
-                <h5 class="modal-title">Dvoufaktorové ověření</h5>
-                <button type="button" class="close" data-dismiss="modal" aria-label="Zavřít"><span aria-hidden="true">&times;</span></button>
+                <h5 class="modal-title">@L.GetResource("MFA_Titulek_Nastavit2FA")</h5>
+                <button type="button" class="close" data-dismiss="modal" aria-label="@L.GetResource("App_Zavrit")">
+                    <span aria-hidden="true">&times;</span>
+                </button>
             </div>
-
-            <div class="modal-body">
-
-                <!-- KROK 1: QR + ověření TOTP -->
-                <div id="mfaW-step1" class="mfaW-step">
-                    <div class="text-center mb-2">
-                        <img id="mfaW-qr" alt="QR" style="width:240px;height:240px;border:1px solid #eee;border-radius:6px;">
-                    </div>
-                    <p class="mb-2" style="font-size:.95rem;">Naskenujte QR v ověřovací aplikaci, případně zadejte manuální kód:</p>
-                    <div id="mfaW-manual" class="mb-3" style="font-family:monospace; font-size:1.05rem; letter-spacing:1px;">•••• •••• ••••</div>
-
-                    <input id="mfaW-totp" class="form-control form-control-lg mb-2" placeholder="Kód z aplikace"
-                           inputmode="numeric" maxlength="8" autocomplete="one-time-code" />
-
-                    <div id="mfaW-err1" class="alert alert-danger" role="alert" style="display:none;"></div>
-
-                    <button type="button" class="btn btn-primary btn-lg btn-block" onclick="MFAW.verifyTotp()">Ověřit kód</button>
-                </div>
-
-                <!-- KROK 2: Zobrazení záložních kódů -->
-                <div id="mfaW-step2" class="mfaW-step" style="display:none;">
-                    <div class="alert alert-warning text-left" role="alert" style="font-size:.95rem;">
-                        <strong>Uložte si tyto záložní kódy.</strong> Zobrazí se pouze jednou.
-                    </div>
-                    <div id="mfaW-codes" class="mb-3" style="font-family:monospace; font-size:1.05rem; line-height:1.6;"></div>
-
-                    <div class="text-left mb-2" style="font-size:.95rem;">
-                        <input type="checkbox" id="mfaW-saved" />
-                        <label for="mfaW-saved">&nbsp;Kódy jsem si uložil/a.</label>
-                    </div>
-
-                    <div id="mfaW-err2" class="alert alert-danger" role="alert" style="display:none;"></div>
-
-                    <button type="button" class="btn btn-primary btn-lg btn-block" onclick="MFAW.confirmSaved()">Pokračovat</button>
-                </div>
-
-                <!-- KROK 3: Ověření jednoho záložního kódu (ne spotřeba) -->
-                <div id="mfaW-step3" class="mfaW-step" style="display:none;">
-                    <div class="alert alert-info text-left" role="alert" style="font-size:.95rem;">
-                        Zadejte <strong>jeden</strong> ze záložních kódů pro potvrzení.
-                        <strong>Tento kód nebude spotřebován</strong>.
-                    </div>
-
-                    <input id="mfaW-backup" class="form-control form-control-lg mb-2" placeholder="Záložní kód" maxlength="32" autocomplete="off" />
-
-                    <div id="mfaW-err3" class="alert alert-danger" role="alert" style="display:none;"></div>
-
-                    <button type="button" class="btn btn-primary btn-lg btn-block" onclick="MFAW.verifyBackup()">Ověřit a aktivovat</button>
-                </div>
-
-                <!-- KROK 4: Hotovo -->
-                <div id="mfaW-step4" class="mfaW-step" style="display:none;">
-                    <div class="alert alert-success text-left" role="alert" style="font-size:.95rem;">
-                        Dvoufaktorové ověření je aktivní. Příště může být požadováno při přihlášení.
-                    </div>
-
-                    <button type="button" class="btn btn-primary btn-lg btn-block" data-dismiss="modal" onclick="MFAW.afterFinish()">Zavřít</button>
-                </div>
-
-            </div>
+            <div id="mfaWizardBody" class="modal-body"></div>
         </div>
     </div>
 </div>
 
-<form id="af-login" style="display:none">
-    @Html.AntiForgeryToken()
-</form>
+<script>
+    (function(){
+      function hasJq(){ return !!(window.jQuery && typeof window.jQuery.fn.modal === 'function'); }
+      async function openMfaWizard(){
+          var host = document.getElementById('mfaWizardBody');
+          if (!host) return;
+
+          // otevři modal
+          if (hasJq()) window.jQuery('#mfaWizardModal').modal('show');
+          else {
+              var m = document.getElementById('mfaWizardModal');
+              if (m){ m.style.display='block'; m.classList.add('show'); document.body.classList.add('modal-open'); }
+              if (!document.getElementById('mfaW-backdrop')){
+                var bd = document.createElement('div'); bd.id='mfaW-backdrop'; bd.className='modal-backdrop fade show'; document.body.appendChild(bd);
+              }
+          }
+
+          // načti view
+          host.innerHTML = '<div class="text-muted">@L.GetResource("MFA_Nacitani")</div>';
+          try{
+              var res = await fetch('/Dvoufaktor/Wizard', { headers:{ 'Accept':'text/html'}});
+              host.innerHTML = res.ok ? (await res.text()) : '<div class="text-danger">@L.GetResource("MFA_Err_Nacteni")</div>';
+          }catch{
+              host.innerHTML = '<div class="text-danger">@L.GetResource("MFA_Err_Sit")</div>';
+          }
+      }
+      window.MFAW_open = openMfaWizard;
+    })();
+</script>
+
+<form id="af-login" style="display:none">@Html.AntiForgeryToken()</form>
 
 @RenderSection("Scripts", required: false)
 @RenderSection("Styles", required: false)

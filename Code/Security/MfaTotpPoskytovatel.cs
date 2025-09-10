@@ -1,5 +1,4 @@
-﻿// MfaTotpPoskytovatel.cs
-using Microsoft.AspNetCore.DataProtection;
+﻿using Microsoft.AspNetCore.DataProtection;
 using OtpNet;
 using System;
 using System.Collections.Generic;

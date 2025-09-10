@@ -49,6 +49,15 @@ namespace Datona.Web.Controllers
 
         public string Issuer { get; set; } = "PiCCOLO";
 
+        // GET: /Dvoufaktor/Wizard
+        [HttpGet]
+        public IActionResult Wizard()
+        {
+            // view nevyžaduje data z modelu, vše si načítá přes JSON akce
+            // necháme default Layout = null (viz View), protože obsah se vkládá do modálu
+            return View("Wizard");
+        }
+
         [HttpPost]
         [ValidateAntiForgeryToken]
         public IActionResult StartJson()
