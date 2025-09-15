@@ -1,6 +1,7 @@
 ﻿using Datona.MobilniCisnik.Server;
 using Datona.Web.Code;
 using Datona.Web.Code.Security;
+using Datona.Web.Models;
 using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.Logging;
@@ -8,6 +9,7 @@ using System;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using static Datona.Web.Code.Security.MfaUlozisteGcr;
 
 namespace Datona.Web.Controllers
 {
@@ -47,61 +49,76 @@ namespace Datona.Web.Controllers
             return ac;
         }
 
-        public string Issuer { get; set; } = "PiCCOLO";
+        // TTL pro pending metodu – uprav podle potřeby
+        private static readonly TimeSpan PendingTtl = TimeSpan.FromMinutes(30);
 
-        // GET: /Dvoufaktor/Wizard
+        private static bool IsPendingExpired(UserMfaMethod m)
+        {
+            // používáme CreatedAt; pokud máš v meta vlastní expiraci, můžeš ji preferovat
+            // pro jistotu bereme UTC porovnání
+            var created = DateTime.SpecifyKind(m.CreatedAt, DateTimeKind.Utc);
+            return DateTime.UtcNow - created > PendingTtl;
+        }
+
         [HttpGet]
         public IActionResult Wizard()
         {
-            // view nevyžaduje data z modelu, vše si načítá přes JSON akce
-            // necháme default Layout = null (viz View), protože obsah se vkládá do modálu
-            return View("Wizard");
-        }
+            var ac = AuthCookie.AuthenticationClaim(Request.Cookies[".ASPXAUTH"]);
+            if (ac == null) return Unauthorized();
 
-        [HttpPost]
-        [ValidateAntiForgeryToken]
-        public IActionResult StartJson()
-        {
-            try
+            var inst = _gcr.Instance(new UserContext
             {
-                var ac = GetAcOrThrow();
+                Login = ac.UserName,
+                HesloMD5 = ac.HesloMD5,
+                MacAddress = "00-0C-E3-24-5A-CC",
+                language_id = "1",
+                InstanceId = ac.InstanceId,
+                Guid_externi_db = ac.Guid_externi_db
+            });
+            if (inst == null) return StatusCode(500, "Instance není k dispozici.");
 
-                if (_store.HasAnyActiveMethodAsync(ac.LoginentityId).GetAwaiter().GetResult())
-                    return Json(new { ok = false, err = "Už máte aktivní 2FA." });
+            var userId = inst.GetLoginentityId();
 
+            // už aktivní?
+            var active = _store.GetActiveTotpAsync(userId).GetAwaiter().GetResult();
+            if (active != null)
+            {
+                return View("Wizard", new MfaWizardViewModel { IsActive = true });
+            }
+
+            // zkus pending
+            var pending = _store.GetLatestPendingTotpAsync(userId).GetAwaiter().GetResult();
+
+            // pokud pending existuje, ale je expirovaný -> založ nový (nerecyklovat expirovaný)
+            if (pending != null && IsPendingExpired(pending))
+            {
+                pending = null; // vynutit založení nového
+            }
+
+            if (pending == null)
+            {
+                var issuer = "Pokladna PiCCOLO";
+                var label = ac.UserName ?? "user";
                 var secret = _totp.GenerateSecret();
-                var issuer = Issuer;
-                var label = $"user:{ac.UserName}";
-                var period = 30;
-                var digits = 6;
+                var metaJson = _totp.BuildMetaJson(secret, issuer, label, period: 30, digits: 6);
 
-                var protectedSecret = _protector.Protect(Encoding.UTF8.GetBytes(secret));
-
-                var metaJson = JsonSerializer.Serialize(new
-                {
-                    issuer,
-                    label,
-                    period,
-                    digits,
-                    secret_p = protectedSecret
-                });
-
-                var methodId = _store
-                    .CreatePendingTotpAsync(ac.LoginentityId, metaJson)
-                    .GetAwaiter().GetResult();
-
-                // ULOŽ DO SESSION
-                HttpContext.Session.SetString("MFA.PENDING_ID", methodId.ToString());
-
-                var otpUri = _totp.BuildOtpAuthUri(issuer, label, secret, digits, period);
-
-                return Json(new { ok = true, otpAuthUri = otpUri, manualKey = _totp.FormatManualKey(secret) });
+                _store.CreatePendingTotpAsync(userId, metaJson).GetAwaiter().GetResult();
+                pending = _store.GetLatestPendingTotpAsync(userId).GetAwaiter().GetResult();
+                if (pending == null) return StatusCode(500, "Nepodařilo se založit TOTP metodu.");
             }
-            catch (Exception ex)
+
+            HttpContext.Session.SetString("MFA.PENDING_ID", pending.Id.ToString());
+
+            var meta = _totp.ParseMeta(pending.MetaJson);
+            var vm = new MfaWizardViewModel
             {
-                _log.LogError(ex, "TwoFA StartJson error");
-                return Json(new { ok = false, err = ex.Message });
-            }
+                MethodId = pending.Id,
+                OtpAuthUri = _totp.BuildOtpAuthUri(meta.issuer, meta.label, meta.secret, meta.digits, meta.period),
+                ManualKey = _totp.FormatManualKey(meta.secret),
+                UserLabel = meta.label,
+                IsActive = false
+            };
+            return View("Wizard", vm);
         }
 
         [HttpPost]
@@ -117,10 +134,8 @@ namespace Datona.Web.Controllers
                     return Json(new { ok = false, err = "Metoda neexistuje." });
 
                 var json = JsonDocument.Parse(method.MetaJson).RootElement;
-                var protectedSecret = json.GetProperty("secret_p").GetString() ?? ""; //TODO zatím vyřadit šifrování, nastavíme prefix
-                var secret = Encoding.UTF8.GetString(
-                    _protector.Unprotect(protectedSecret)
-                );
+                //var protectedSecret = json.GetProperty("secret").GetString() ?? ""; //TODO zatím vyřadit šifrování, nastavíme prefix
+                var secret = json.GetProperty("secret").GetString() ?? ""; //Encoding.UTF8.GetString(_protector.Unprotect(protectedSecret));
 
                 if (!_totp.ValidateCode(secret, code))
                 {
@@ -201,7 +216,7 @@ namespace Datona.Web.Controllers
                 if (method != null)
                 {
                     var meta = _totp.ParseMeta(method.MetaJson);
-                    ok = _totp.ValidateCode(Encoding.UTF8.GetString(_protector.Unprotect(meta.secret)), code);
+                    ok = _totp.ValidateCode(meta.secret, code);
                 }
 
                 // 2) pokud TOTP neprojde, zkus záložní kód
@@ -302,6 +317,68 @@ namespace Datona.Web.Controllers
             {
                 // zaloguj ex.ToString()
                 return Json(new { ok = false, err = "Nepodařilo se vypnout 2FA." });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public IActionResult GenerateNewBackupCodesPreviewJson()
+        {
+            try
+            {
+                var userId = GetAcOrThrow().LoginentityId;
+
+                // vygeneruj novou sadu (plaintext + hash), ale NIC zatím nezapisuj do DB
+                var batch = _backup.GenerateBatch(); // (plain, hashed)
+                var payload = new
+                {
+                    plain = batch.plain.ToArray(),
+                    hashed = batch.hashed.ToArray()
+                };
+
+                // ulož do Session pro následné potvrzení
+                HttpContext.Session.SetString("MFA.NEW_BATCH", System.Text.Json.JsonSerializer.Serialize(payload));
+
+                // vrať náhled kódů (plaintext) pro zobrazení
+                return Json(new { ok = true, codes = payload.plain });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA GenerateNewBackupCodesPreviewJson error");
+                return Json(new { ok = false, err = "Nepodařilo se připravit novou dávku." });
+            }
+        }
+
+        [HttpPost]
+        [ValidateAntiForgeryToken]
+        public IActionResult ConfirmNewBackupCodesJson()
+        {
+            try
+            {
+                var userId = GetAcOrThrow().LoginentityId;
+
+                var s = HttpContext.Session.GetString("MFA.NEW_BATCH");
+                if (string.IsNullOrEmpty(s))
+                    return Json(new { ok = false, err = "Chybí připravená dávka. Zkuste znovu vygenerovat." });
+
+                var tmp = System.Text.Json.JsonDocument.Parse(s).RootElement;
+                var hashed = tmp.GetProperty("hashed").EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).ToArray();
+
+                // 1) Zruš pouze nepoužité staré kódy (použité necháme)
+                _store.RemoveUnusedBackupCodesAsync(userId).GetAwaiter().GetResult();
+
+                // 2) Zapiš novou dávku (podle hashed)
+                _store.InsertBackupCodesAsync(userId, hashed).GetAwaiter().GetResult();
+
+                // 3) Úklid Session
+                HttpContext.Session.Remove("MFA.NEW_BATCH");
+
+                return Json(new { ok = true });
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "TwoFA ConfirmNewBackupCodesJson error");
+                return Json(new { ok = false, err = "Nepodařilo se potvrdit novou dávku." });
             }
         }
     }

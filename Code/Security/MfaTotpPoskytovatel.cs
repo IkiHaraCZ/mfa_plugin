@@ -1,4 +1,5 @@
-﻿using Microsoft.AspNetCore.DataProtection;
+﻿// MfaTotpPoskytovatel.cs
+using Microsoft.AspNetCore.DataProtection;
 using OtpNet;
 using System;
 using System.Collections.Generic;
@@ -15,6 +16,7 @@ namespace Datona.Web.Code.Security
         bool ValidateCode(string secret, string code);
         string FormatManualKey(string secretBase32);
         (string secret, string issuer, string label, int period, int digits) ParseMeta(string metaJson);
+        string BuildMetaJson(string secret, string issuer, string label, int period, int digits);
     }
     public sealed class MfaTotpPoskytovatel : ITotpService
     {
@@ -68,12 +70,17 @@ namespace Datona.Web.Code.Security
             using var doc = JsonDocument.Parse(metaJson);
             var r = doc.RootElement;
             return (
-                r.GetProperty("secret_p").GetString()!,
+                r.GetProperty("secret").GetString()!,
                 r.GetProperty("issuer").GetString()!,
                 r.GetProperty("label").GetString()!,
                 r.GetProperty("period").GetInt32(),
                 r.GetProperty("digits").GetInt32()
             );
+        }
+
+        public string BuildMetaJson(string secret, string issuer, string label, int period, int digits)
+        {
+            return JsonSerializer.Serialize(new { secret, issuer, label, period, digits });
         }
 
         // ---- helpers ----
